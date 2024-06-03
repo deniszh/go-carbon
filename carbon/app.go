@@ -27,6 +27,7 @@ import (
 	// register receivers
 	_ "github.com/go-graphite/go-carbon/receiver/http"
 	_ "github.com/go-graphite/go-carbon/receiver/kafka"
+	_ "github.com/go-graphite/go-carbon/receiver/mangos"
 	_ "github.com/go-graphite/go-carbon/receiver/pubsub"
 	_ "github.com/go-graphite/go-carbon/receiver/tcp"
 	_ "github.com/go-graphite/go-carbon/receiver/udp"

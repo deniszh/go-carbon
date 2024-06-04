@@ -31,7 +31,7 @@ func init() {
 }
 
 type Options struct {
-	Listen  string `toml:"url"`
+	URL     string `toml:"url"`
 	Enabled bool   `toml:"enabled"`
 }
 
@@ -50,7 +50,7 @@ type MANGOS struct {
 
 func NewOptions() *Options {
 	return &Options{
-		Listen:  "tcp://0.0.0.0:2003",
+		URL:     "tcp://0.0.0.0:2008",
 		Enabled: true,
 	}
 }
@@ -72,7 +72,7 @@ func newMANGOS(name string, options *Options, store func(*points.Points)) (*MANG
 	if err != nil {
 		return nil, err
 	}
-	if err = sock.Listen(options.Listen); err != nil {
+	if err = sock.Listen(options.URL); err != nil {
 		return nil, err
 	}
 

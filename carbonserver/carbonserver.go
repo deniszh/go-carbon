@@ -291,6 +291,8 @@ type CarbonserverListener struct {
 	quotaAndUsageMetrics      chan []points.Points
 	quotaUsageReportFrequency time.Duration
 	maxCreatesPerSecond       int
+	autoCreates               *adaptiveCreateThrottle
+	autoCreatesDone           chan struct{}
 
 	interfalInfoCallbacks map[string]func() map[string]interface{}
 
@@ -824,8 +826,7 @@ func (listener *CarbonserverListener) statKnownMetrics(knownMetricsStatTicker <-
 	atomic.StoreUint64(&listener.metrics.TrieNodes, uint64(count))
 	atomic.StoreUint64(&listener.metrics.TrieFiles, uint64(files))
 	atomic.StoreUint64(&listener.metrics.TrieDirs, uint64(dirs))
-	atomic.StoreUint64(&listener.metrics.ThrottledCreates, fidx.trieIdx.throttledCreates) // throttled per minute
-	atomic.AddUint64(&fidx.trieIdx.throttledCreates, -fidx.trieIdx.throttledCreates)
+	atomic.StoreUint64(&listener.metrics.ThrottledCreates, atomic.SwapUint64(&fidx.trieIdx.throttledCreates, 0)) // throttled per minute
 	atomic.StoreUint64(&listener.metrics.MaxCreatesPerSecond, uint64(listener.maxCreatesPerSecond))
 	// set using the indexed files, instead of returning on-disk files.
 	//
@@ -871,8 +872,7 @@ func (listener *CarbonserverListener) refreshQuotaAndUsage(quotaAndUsageStatTick
 
 	quotaTime := uint64(time.Since(quotaStart))
 	atomic.StoreUint64(&listener.metrics.QuotaApplyTimeNs, quotaTime)
-	atomic.StoreUint64(&listener.metrics.ThrottledCreates, fidx.trieIdx.throttledCreates) // throttled per minute
-	atomic.AddUint64(&fidx.trieIdx.throttledCreates, -fidx.trieIdx.throttledCreates)
+	atomic.StoreUint64(&listener.metrics.ThrottledCreates, atomic.SwapUint64(&fidx.trieIdx.throttledCreates, 0)) // throttled per minute
 	atomic.StoreUint64(&listener.metrics.MaxCreatesPerSecond, uint64(listener.maxCreatesPerSecond))
 
 	usageStart := time.Now()
@@ -947,7 +947,7 @@ func (listener *CarbonserverListener) updateFileList(dir string, cacheMetricName
 	var infos []zap.Field
 	if listener.trieIndex {
 		if fidx == nil || !listener.concurrentIndex {
-			trieIdx = newTrie(".wsp", listener.maxCreatesPerSecond, listener.estimateSize)
+			trieIdx = listener.newTrie()
 		} else {
 			trieIdx = fidx.trieIdx
 			trieIdx.root.gen++
@@ -995,7 +995,7 @@ func (listener *CarbonserverListener) updateFileList(dir string, cacheMetricName
 					infos = append(infos, zap.NamedError("file_list_cache_read_error", err))
 
 					readFromCache = false
-					trieIdx = newTrie(".wsp", listener.maxCreatesPerSecond, listener.estimateSize)
+					trieIdx = listener.newTrie()
 
 					break
 				}
@@ -1008,7 +1008,7 @@ func (listener *CarbonserverListener) updateFileList(dir string, cacheMetricName
 					listener.logTrieInsertError(logger, "failed to read from file list cache", entry.Path, err)
 
 					readFromCache = false
-					trieIdx = newTrie(".wsp", listener.maxCreatesPerSecond, listener.estimateSize)
+					trieIdx = listener.newTrie()
 
 					break
 				}
@@ -1551,6 +1551,10 @@ func (listener *CarbonserverListener) Stat(send helper.StatCallback) {
 	sender("find_metrics_found_without_response_cache", &listener.metrics.findMetricsFoundWithoutResponseCache, send)
 	sender("throttled_creates", &listener.metrics.ThrottledCreates, send)
 	sender("max_creates_per_second", &listener.metrics.MaxCreatesPerSecond, send)
+	if listener.autoCreates != nil {
+		// This is a gauge, regardless of metrics-as-counters.
+		send("max_creates_per_second_effective", float64(listener.autoCreates.currentRate()))
+	}
 	sender("fetch_size_bytes", &listener.metrics.FetchSize, send)
 
 	senderRaw("metrics_known", &listener.metrics.MetricsKnown, send)
@@ -1643,11 +1647,16 @@ func (listener *CarbonserverListener) Stat(send helper.StatCallback) {
 }
 
 func (listener *CarbonserverListener) Stop() error {
-	close(listener.forceScanChan)
+	if listener.forceScanChan != nil {
+		close(listener.forceScanChan)
+	}
 	if listener.scanTicker != nil {
 		listener.scanTicker.Stop()
 	}
 	close(listener.exitChan)
+	if listener.autoCreatesDone != nil {
+		<-listener.autoCreatesDone
+	}
 	if listener.db != nil {
 		listener.db.Close()
 	}
@@ -1988,6 +1997,7 @@ func (listener *CarbonserverListener) Listen(listen string) error {
 	}
 
 	go srv.Serve(listener.tcpListener)
+	listener.startCreateThrottle()
 
 	return nil
 }

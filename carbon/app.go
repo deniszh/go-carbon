@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -66,6 +67,8 @@ type App struct {
 	PromRegistry   *prometheus.Registry
 	exit           chan bool
 	FlushTraces    func()
+
+	whisperEstimateConfig atomic.Pointer[whisperConfig]
 }
 
 var registerPluginsOnce sync.Once
@@ -98,6 +101,11 @@ func (app *App) configure() error {
 	cfg, err := ReadConfig(app.ConfigFilename)
 	if err != nil {
 		return err
+	}
+	if app.Carbonserver != nil && app.Carbonserver.MaxCreatesPerSecondAutoEnabled() {
+		if err := validateAutoCreatesCacheSize(cfg.Cache.MaxSize); err != nil {
+			return err
+		}
 	}
 
 	// carbon-cache prefix
@@ -165,6 +173,7 @@ func (app *App) configure() error {
 		}
 	}
 
+	app.whisperEstimateConfig.Store(&cfg.Whisper)
 	app.Config = cfg
 
 	return nil
@@ -372,6 +381,10 @@ func (app *App) Start() (err error) {
 	}()
 
 	conf := app.Config
+	if err := conf.validateAutoCreates(); err != nil {
+		return err
+	}
+	app.whisperEstimateConfig.Store(&conf.Whisper)
 
 	runtime.GOMAXPROCS(conf.Common.MaxCPU)
 
@@ -543,6 +556,15 @@ func (app *App) Start() (err error) {
 		carbonserver.SetScanFrequency(conf.Carbonserver.ScanFrequency.Value())
 		carbonserver.SetQuotaUsageReportFrequency(conf.Carbonserver.QuotaUsageReportFrequency.Value())
 		carbonserver.SetMaxCreatesPerSecond(conf.Carbonserver.MaxCreatesPerSecond)
+		if conf.Carbonserver.MaxCreatesPerSecondAuto {
+			if err := carbonserver.SetMaxCreatesPerSecondAuto(
+				conf.Carbonserver.MaxCreatesPerSecondAutoLowWatermark,
+				conf.Carbonserver.MaxCreatesPerSecondAutoHighWatermark,
+				func() (int64, int64) { return core.Size(), core.MaxSize() },
+			); err != nil {
+				return err
+			}
+		}
 		carbonserver.SetReadTimeout(conf.Carbonserver.ReadTimeout.Value())
 		carbonserver.SetIdleTimeout(conf.Carbonserver.IdleTimeout.Value())
 		carbonserver.SetWriteTimeout(conf.Carbonserver.WriteTimeout.Value())
@@ -576,13 +598,16 @@ func (app *App) Start() (err error) {
 			carbonserver.SetHeavyGlobQueryRateLimiters(globQueryRateLimiters)
 		}
 
-		if app.Config.Whisper.Quotas != nil {
+		if app.Config.Whisper.Quotas != nil || conf.Carbonserver.MaxCreatesPerSecondAuto {
 			if !conf.Carbonserver.ConcurrentIndex || conf.Carbonserver.RealtimeIndex <= 0 {
 				return errors.New("concurrent-index and realtime-index needs to be enabled for quota control.")
 			}
 
 			carbonserver.SetEstimateSize(func(metric string) (logicalSize, physicalSize, dataPoints int64) {
-				schema, ok := app.Config.Whisper.Schemas.Match(metric)
+				// Reload publishes a new immutable snapshot without taking the
+				// app lock while admission holds a cache shard lock.
+				whisperConfig := app.whisperEstimateConfig.Load()
+				schema, ok := whisperConfig.Schemas.Match(metric)
 
 				if !ok {
 					// Why not configurable: go-carbon users
@@ -594,8 +619,8 @@ func (app *App) Start() (err error) {
 					dataPoints += int64(r.NumberOfPoints())
 				}
 				logicalSize = 4096 + dataPoints*12
-				if app.Config.Whisper.Sparse { // we assume that physical size for sparse metrics takes only a part of the logical size
-					physicalSize = int64(app.Config.Whisper.PhysicalSizeFactor * float32(logicalSize))
+				if whisperConfig.Sparse { // we assume that physical size for sparse metrics takes only a part of the logical size
+					physicalSize = int64(whisperConfig.PhysicalSizeFactor * float32(logicalSize))
 				} else {
 					physicalSize = logicalSize
 				}

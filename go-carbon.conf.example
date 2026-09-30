@@ -254,8 +254,26 @@ listen = "127.0.0.1:8080"
 enabled = true
 # Buckets to track response times
 buckets = 10
-# Hard limits the number of whisper files that get created each second. 0 - no limit
+# Limits admission of new metric names; excess batches are dropped, not queued.
+# Existing cached/indexed metrics and already queued file writes are not paced.
+# With auto disabled, quota-control wiring is required for this limit to apply.
+# 0 - no limit (not allowed with auto enabled).
 max-creates-per-second = 0
+# Adapt new-metric admission to cache pressure; no quotas-file is required.
+# Requires whisper.enabled, carbonserver.enabled, trie-index, concurrent-index,
+# positive realtime-index and scan-frequency, and a positive cache.max-size.
+# Watermarks are fractions of cache.max-size (datapoints, not bytes).
+# Every 5s: at/above high halve the rate (floor 1/sec); at/below low add 5% of
+# the configured rate, rounded up; hold between them. Start and cap at the
+# configured max-creates-per-second. Burst capacity is one second of this rate.
+# Auto settings and the configured ceiling require restart. Positive cache
+# max-size reloads are observed, but it cannot become unlimited while auto runs.
+# Startup, state transitions, rate adjustments, and shutdown are logged at INFO.
+# The existing index-not-ready bypass remains; this cannot prevent overflow
+# caused by existing-series traffic or drain an already admitted backlog.
+max-creates-per-second-auto = false
+max-creates-per-second-auto-low-watermark = 0.50
+max-creates-per-second-auto-high-watermark = 0.80
 # carbonserver-specific metrics will be sent as counters
 # For compatibility with grobian/carbonserver
 metrics-as-counters = false

@@ -134,6 +134,11 @@ func (c *Cache) SetMaxSize(maxSize uint64) {
 	c.settings.Store(&newSettings)
 }
 
+// MaxSize returns the current datapoint limit, including changes made on reload.
+func (c *Cache) MaxSize() int64 {
+	return c.settings.Load().(*cacheSettings).maxSize
+}
+
 // SetBloomSize of bloom filter
 func (c *Cache) SetBloomSize(bloomSize uint64) {
 	if bloomSize > 0 {

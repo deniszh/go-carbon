@@ -296,6 +296,7 @@ type trieIndex struct {
 	qauMetrics       []points.Points
 	estimateSize     func(metric string) (logicalSize, physicalSize, dataPoints int64)
 	maxCreatesTicker *helper.ThrottleTicker
+	autoCreates      *adaptiveCreateThrottle
 	throttledCreates uint64
 	throughputs      *throughputQuotaManager
 	resetFrequency   time.Duration
@@ -2064,6 +2065,13 @@ func (ti *trieIndex) getNodeFullPath(node *trieNode) string { // skipcq: SCC-U10
 	return ""
 }
 func (ti *trieIndex) maxCreatesThrottle() bool {
+	if ti.autoCreates != nil {
+		if ti.autoCreates.allow() {
+			return false
+		}
+		atomic.AddUint64(&ti.throttledCreates, 1)
+		return true
+	}
 	select {
 	case keep, open := <-ti.maxCreatesTicker.C:
 		if keep || !open {

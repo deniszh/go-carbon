@@ -5,6 +5,7 @@ import (
 	"encoding"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -157,6 +158,10 @@ type carbonserverConfig struct {
 	QuotaUsageReportFrequency *Duration `toml:"quota-usage-report-frequency"`
 	MaxCreatesPerSecond       int       `toml:"max-creates-per-second"`
 
+	MaxCreatesPerSecondAuto              bool    `toml:"max-creates-per-second-auto"`
+	MaxCreatesPerSecondAutoLowWatermark  float64 `toml:"max-creates-per-second-auto-low-watermark"`
+	MaxCreatesPerSecondAutoHighWatermark float64 `toml:"max-creates-per-second-auto-high-watermark"`
+
 	NoServiceWhenIndexIsNotReady bool `toml:"no-service-when-index-is-not-ready"`
 
 	// TODO: depcreate, replaced by APIPerPathRateLimiters
@@ -279,6 +284,10 @@ func NewConfig() *Config {
 			MaxGlobs:          100,
 			FailOnMaxGlobs:    false,
 			MetricsAsCounters: false,
+
+			MaxCreatesPerSecondAutoLowWatermark:  0.50,
+			MaxCreatesPerSecondAutoHighWatermark: 0.80,
+
 			ScanFrequency: &Duration{
 				Duration: 300 * time.Second,
 			},
@@ -420,7 +429,38 @@ func ReadConfig(filename string) (*Config, error) {
 		return nil, err
 	}
 
+	if err := cfg.validateAutoCreates(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func validateAutoCreatesCacheSize(maxSize uint64) error {
+	if maxSize == 0 || maxSize > math.MaxInt64 {
+		return fmt.Errorf("carbonserver.max-creates-per-second-auto requires cache.max-size between 1 and %d", int64(math.MaxInt64))
+	}
+	return nil
+}
+
+func (cfg *Config) validateAutoCreates() error {
+	c := cfg.Carbonserver
+	if !c.MaxCreatesPerSecondAuto {
+		return nil
+	}
+	if !c.Enabled || !cfg.Whisper.Enabled {
+		return fmt.Errorf("carbonserver.max-creates-per-second-auto requires carbonserver.enabled and whisper.enabled")
+	}
+	if !c.TrieIndex || !c.ConcurrentIndex || c.RealtimeIndex <= 0 || c.ScanFrequency == nil || c.ScanFrequency.Value() <= 0 {
+		return fmt.Errorf("carbonserver.max-creates-per-second-auto requires trie-index, concurrent-index, positive realtime-index and positive scan-frequency")
+	}
+	if c.MaxCreatesPerSecond <= 0 {
+		return fmt.Errorf("carbonserver.max-creates-per-second-auto requires positive max-creates-per-second")
+	}
+	low, high := c.MaxCreatesPerSecondAutoLowWatermark, c.MaxCreatesPerSecondAutoHighWatermark
+	if !(0 < low && low < high && high < 1) {
+		return fmt.Errorf("carbonserver.max-creates-per-second-auto watermarks must satisfy 0 < low < high < 1")
+	}
+	return validateAutoCreatesCacheSize(cfg.Cache.MaxSize)
 }
 
 // TestConfig creates config with all files in root directory

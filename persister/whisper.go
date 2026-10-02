@@ -39,6 +39,7 @@ type Whisper struct {
 	confirm             func(*points.Points)
 	popConfirm          func(string) (*points.Points, bool)
 	requeue             func(*points.Points)
+	metricStore         MetricStore
 	tagsEnabled         bool
 	taggedFn            func(string, bool)
 	schemas             WhisperSchemas
@@ -405,6 +406,11 @@ func (p *Whisper) store(metric string) {
 	p.storeMutex[mutexIndex].Lock()
 	// atomic.AddUint64(&p.blockAvoidConcurrentNs, uint64(time.Since(start).Nanoseconds()))
 	defer p.storeMutex[mutexIndex].Unlock()
+
+	if p.metricStore != nil {
+		p.storeShared(metric)
+		return
+	}
 
 	var path string
 	if p.tagsEnabled && strings.IndexByte(metric, ';') >= 0 {

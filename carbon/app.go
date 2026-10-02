@@ -17,11 +17,13 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/go-graphite/go-carbon/api"
+	"github.com/go-graphite/go-carbon/buckyd"
 	"github.com/go-graphite/go-carbon/cache"
 	"github.com/go-graphite/go-carbon/carbonserver"
 	"github.com/go-graphite/go-carbon/persister"
 	"github.com/go-graphite/go-carbon/receiver"
 	"github.com/go-graphite/go-carbon/tags"
+	"github.com/go-graphite/go-whisper/store"
 	"github.com/lomik/zapwriter"
 
 	// receivers
@@ -60,6 +62,9 @@ type App struct {
 	CarbonLink     *cache.CarbonlinkListener
 	Persister      *persister.Whisper
 	Carbonserver   *carbonserver.CarbonserverListener
+	MetricStore    *store.Store
+	Buckyd         *buckyd.Service
+	buckydIndex    *metricIndexRefresher
 	Tags           *tags.Tags
 	Collector      *Collector // (!!!) Should be re-created on every change config/modules
 	PromRegisterer prometheus.Registerer
@@ -99,6 +104,9 @@ func (app *App) configure() error {
 	if err != nil {
 		return err
 	}
+	if err := validateStorageConfig(cfg); err != nil {
+		return err
+	}
 
 	// carbon-cache prefix
 	if hostname, err := os.Hostname(); err == nil {
@@ -130,7 +138,7 @@ func (app *App) configure() error {
 			cfg.Whisper.Aggregation = persister.NewWhisperAggregation()
 		}
 
-		if cfg.Whisper.OutOfOrder {
+		if cfg.Whisper.OutOfOrder && cfg.Whisper.StorageBackend == "files" {
 			// the uncompressed format already writes points in any order
 			if !cfg.Whisper.Compressed && !cfg.Whisper.Schemas.AnyCompressed() {
 				return fmt.Errorf("whisper.out-of-order requires whisper.compressed, or a schema with compressed = true")
@@ -172,6 +180,12 @@ func (app *App) configure() error {
 		}
 	}
 
+	if err := validateStorageConfig(cfg); err != nil {
+		return err
+	}
+	if app.Cache != nil && storageSettingsChanged(app.Config, cfg) {
+		return errors.New("storage and buckyd settings require a restart")
+	}
 	app.Config = cfg
 
 	return nil
@@ -250,15 +264,30 @@ func (app *App) stopListeners() {
 		logger.Debug("carbonlink stopped")
 	}
 
+	// Finish transfers and the catalog scan worker before closing the index.
+	if app.Buckyd != nil {
+		if err := app.Buckyd.Stop(); err != nil {
+			logger.Error("stop buckyd", zap.Error(err))
+		}
+		app.Buckyd = nil
+	}
+	if app.buckydIndex != nil {
+		app.buckydIndex.close()
+		app.buckydIndex = nil
+	}
 	if app.Carbonserver != nil {
 		carbonserver := app.Carbonserver
-		go func() {
+		stop := func() {
 			carbonserver.Stop()
 			logger.Debug("carbonserver stopped")
-		}()
+		}
+		if app.MetricStore != nil {
+			stop()
+		} else {
+			go stop()
+		}
 		app.Carbonserver = nil
 	}
-
 	if app.Receivers != nil {
 		for i := 0; i < len(app.Receivers); i++ {
 			app.Receivers[i].Stop()
@@ -301,6 +330,12 @@ func (app *App) stopAll() {
 		app.Collector = nil
 		logger.Debug("collector stopped")
 	}
+	if app.MetricStore != nil {
+		if err := app.MetricStore.Close(); err != nil {
+			logger.Error("close shared storage", zap.Error(err))
+		}
+		app.MetricStore = nil
+	}
 
 	if app.exit != nil {
 		close(app.exit)
@@ -338,6 +373,9 @@ func (app *App) startPersister() {
 			app.Cache.Pop,
 		)
 		p.SetRequeue(app.Cache.Requeue)
+		if app.MetricStore != nil {
+			p.SetMetricStore(app.MetricStore)
+		}
 		p.SetMaxUpdatesPerSecond(app.Config.Whisper.MaxUpdatesPerSecond)
 		p.SetSparse(app.Config.Whisper.Sparse)
 		p.SetFLock(app.Config.Whisper.FLock)
@@ -381,6 +419,9 @@ func (app *App) Start() (err error) {
 	}()
 
 	conf := app.Config
+	if err = validateStorageConfig(conf); err != nil {
+		return err
+	}
 
 	runtime.GOMAXPROCS(conf.Common.MaxCPU)
 
@@ -391,6 +432,14 @@ func (app *App) Start() (err error) {
 	core.SetBloomSize(conf.Cache.BloomSize)
 
 	app.Cache = core
+	if conf.Whisper.StorageBackend == "pebble" {
+		app.MetricStore, err = store.Open(sharedStorePath(conf), store.Options{
+			CacheSize: conf.Whisper.StoreCacheSize, MemTableSize: conf.Whisper.StoreMemTableSize,
+		})
+		if err != nil {
+			return fmt.Errorf("open shared storage: %w", err)
+		}
+	}
 
 	/* API start */
 	if conf.Grpc.Enabled {
@@ -509,7 +558,7 @@ func (app *App) Start() (err error) {
 			return
 		}
 
-		if conf.Carbonserver.TrigramIndex || conf.Carbonserver.TrieIndex {
+		if app.MetricStore == nil && (conf.Carbonserver.TrigramIndex || conf.Carbonserver.TrieIndex) {
 			if fi, err := os.Lstat(conf.Whisper.DataDir); err != nil {
 				return fmt.Errorf("failed to stat whisper data directory: %w", err)
 			} else if fi.Mode()&os.ModeSymlink == 1 {
@@ -537,6 +586,10 @@ func (app *App) Start() (err error) {
 		// TODO: refactor: do not use var name the same as pkg name
 		carbonserver := carbonserver.NewCarbonserverListener(core.Get)
 		carbonserver.SetWhisperData(conf.Whisper.DataDir)
+		if app.MetricStore != nil {
+			carbonserver.SetWhisperData(sharedStorePath(conf))
+		}
+		carbonserver.SetMetricStore(app.MetricStore)
 		carbonserver.SetMaxGlobs(conf.Carbonserver.MaxGlobs)
 		carbonserver.SetEmptyResultOk(conf.Carbonserver.EmptyResultOk)
 		carbonserver.SetDoNotLog404s(conf.Carbonserver.DoNotLog404s)
@@ -601,6 +654,9 @@ func (app *App) Start() (err error) {
 
 				for _, r := range schema.Retentions {
 					dataPoints += int64(r.NumberOfPoints())
+				}
+				if app.MetricStore != nil {
+					return int64(16+12*len(schema.Retentions)) + dataPoints*12, 0, dataPoints
 				}
 				logicalSize = 4096 + dataPoints*12
 				if app.Config.Whisper.Sparse { // we assume that physical size for sparse metrics takes only a part of the logical size
@@ -706,6 +762,19 @@ func (app *App) Start() (err error) {
 	/* COLLECTOR start */
 	app.Collector = NewCollector(app)
 	/* COLLECTOR end */
+	if conf.Buckyd.Enabled {
+		app.Buckyd, err = buckyd.New(conf.Buckyd, app.MetricStore)
+		if err != nil {
+			return fmt.Errorf("configure buckyd: %w", err)
+		}
+		if app.Carbonserver != nil {
+			app.buckydIndex = startMetricIndexRefresher(app.Carbonserver, buckydIndexRefreshInterval)
+			app.Buckyd.SetOnChange(app.buckydIndex.notify)
+		}
+		if err = app.Buckyd.Start(); err != nil {
+			return fmt.Errorf("start buckyd: %w", err)
+		}
+	}
 
 	return
 }
@@ -722,6 +791,10 @@ func (app *App) Loop() {
 }
 
 func (app *App) CheckPersisterPolicyConsistencies(rate int, printInconsistentMetrics bool) {
+	if app.Config.Whisper.StorageBackend == "pebble" {
+		log.Print("the file policy consistency checker is unavailable for shared storage; inspect metric policies through carbonserver info")
+		return
+	}
 	p := persister.NewWhisper(
 		app.Config.Whisper.DataDir,
 		app.Config.Whisper.Schemas,

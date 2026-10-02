@@ -57,6 +57,7 @@ import (
 	"github.com/go-graphite/go-carbon/helper/stat"
 	"github.com/go-graphite/go-carbon/points"
 	whisper "github.com/go-graphite/go-whisper"
+	"github.com/go-graphite/go-whisper/store"
 	grpcv2 "github.com/go-graphite/protocol/carbonapi_v2_grpc"
 	protov3 "github.com/go-graphite/protocol/carbonapi_v3_pb"
 	"github.com/lomik/zapwriter"
@@ -237,9 +238,13 @@ type CarbonserverListener struct {
 	scanFrequency     time.Duration
 	scanTicker        *time.Ticker
 	forceScanChan     chan struct{}
+	fileListUpdaterWG sync.WaitGroup
 	metricsAsCounters bool
 	tcpListener       *net.TCPListener
 	grpcListener      *net.TCPListener
+	httpServer        *http.Server
+	grpcServer        *grpc.Server
+	serverWG          sync.WaitGroup
 	logger            *zap.Logger
 	accessLogger      *zap.Logger
 	internalStatsDir  string
@@ -271,8 +276,11 @@ type CarbonserverListener struct {
 	realtimeIndex  int
 	newMetricsChan chan string
 
-	fileIdx      atomic.Value
-	fileIdxMutex sync.Mutex
+	fileIdx            atomic.Value
+	fileIdxMutex       sync.Mutex
+	metricStoreIndexMu sync.Mutex
+	sharedRequestMu    sync.RWMutex
+	sharedStoreStopped bool
 
 	metrics       *metricStruct
 	requestsTimes requestsTimes
@@ -281,6 +289,8 @@ type CarbonserverListener struct {
 
 	cacheGetRecentMetrics func() []map[string]struct{}
 	whisperGetConfig      configRetriever
+	metricStoreMu         sync.RWMutex
+	metricStore           *store.Store
 
 	prometheus prometheus
 
@@ -509,6 +519,73 @@ func NewCarbonserverListener(cacheGetFunc func(key string) []points.Point) *Carb
 func (listener *CarbonserverListener) SetWhisperData(whisperData string) {
 	listener.whisperData = strings.TrimRight(whisperData, "/")
 }
+
+// SetMetricStore makes carbonserver read metric data and its catalog from an
+// embedded shared Whisper store. The caller owns the store lifecycle.
+func (listener *CarbonserverListener) SetMetricStore(metricStore *store.Store) {
+	listener.metricStoreMu.Lock()
+	listener.metricStore = metricStore
+	listener.metricStoreMu.Unlock()
+	listener.sharedRequestMu.Lock()
+	listener.sharedStoreStopped = false
+	listener.sharedRequestMu.Unlock()
+}
+
+func (listener *CarbonserverListener) getMetricStore() *store.Store {
+	listener.metricStoreMu.RLock()
+	defer listener.metricStoreMu.RUnlock()
+	return listener.metricStore
+}
+
+// beginSharedStoreRequest keeps a shared-store request alive through its
+// storage read, or rejects one that races listener shutdown.
+func (listener *CarbonserverListener) beginSharedStoreRequest() (accepted, locked bool) {
+	if listener.getMetricStore() == nil {
+		return true, false
+	}
+	listener.sharedRequestMu.RLock()
+	if listener.sharedStoreStopped {
+		listener.sharedRequestMu.RUnlock()
+		return false, false
+	}
+	return true, true
+}
+
+// stopSharedStoreRequests rejects new shared-store reads and waits for in-flight
+// ones. Store reads cannot be cancelled, so a read stuck on the disk must not
+// block shutdown forever.
+func (listener *CarbonserverListener) stopSharedStoreRequests(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		listener.sharedRequestMu.Lock()
+		listener.sharedStoreStopped = true
+		listener.sharedRequestMu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		listener.logger.Warn("shared-store requests still in flight after timeout; continuing shutdown",
+			zap.Duration("timeout", timeout))
+	}
+}
+
+func (listener *CarbonserverListener) endSharedStoreRequest(locked bool) {
+	if locked {
+		listener.sharedRequestMu.RUnlock()
+	}
+}
+
+// RefreshMetricStoreIndex rebuilds the in-memory index from the shared store
+// catalog. Existing indexes stay live if catalog traversal fails.
+func (listener *CarbonserverListener) RefreshMetricStoreIndex() error {
+	metricStore := listener.getMetricStore()
+	if metricStore == nil {
+		return nil
+	}
+	return listener.updateMetricStoreIndex(metricStore)
+}
+
 func (listener *CarbonserverListener) SetMaxGlobs(maxGlobs int) {
 	listener.maxGlobs = maxGlobs
 }
@@ -802,6 +879,14 @@ uloop:
 	}
 }
 
+func (listener *CarbonserverListener) startFileListUpdater(dir string, scanFrequency <-chan time.Time, force <-chan struct{}, exit <-chan struct{}) {
+	listener.fileListUpdaterWG.Add(1)
+	go func() {
+		defer listener.fileListUpdaterWG.Done()
+		listener.fileListUpdater(dir, scanFrequency, force, exit)
+	}()
+}
+
 func (listener *CarbonserverListener) statKnownMetrics(knownMetricsStatTicker <-chan time.Time) {
 	defer func() {
 		// drain remaining blocked tickers
@@ -854,9 +939,14 @@ func (listener *CarbonserverListener) refreshQuotaAndUsage(quotaAndUsageStatTick
 		}
 	}()
 
+	sharedStore := listener.getMetricStore() != nil
+	if sharedStore {
+		listener.metricStoreIndexMu.Lock()
+		defer listener.metricStoreIndexMu.Unlock()
+	}
 	fidx := listener.CurrentFileIndex()
 
-	if !listener.isQuotaEnabled() || !listener.concurrentIndex || listener.realtimeIndex <= 0 || fidx == nil || fidx.trieIdx == nil {
+	if !listener.isQuotaEnabled() || (!sharedStore && (!listener.concurrentIndex || listener.realtimeIndex <= 0)) || fidx == nil || fidx.trieIdx == nil {
 		return
 	}
 
@@ -927,6 +1017,13 @@ func metricFileSizes(path string, info os.FileInfo) (logical, physical int64, er
 }
 
 func (listener *CarbonserverListener) updateFileList(dir string, cacheMetricNames map[string]struct{}, quotaAndUsageStatTicker <-chan time.Time) (readFromCache bool) {
+	if metricStore := listener.getMetricStore(); metricStore != nil {
+		if err := listener.updateMetricStoreIndex(metricStore); err != nil {
+			listener.logger.Error("failed to update shared metric-store index", zap.Error(err))
+		}
+		return false
+	}
+
 	logger := listener.logger.With(zap.String("handler", "fileListUpdated"))
 	defer func() {
 		if r := recover(); r != nil {
@@ -1357,7 +1454,7 @@ func (listener *CarbonserverListener) expandGlobs(ctx context.Context, query str
 	var useGlob bool
 
 	// TODO: Find out why we have set 'useGlob' if 'star == -1'
-	if star := strings.IndexByte(query, '*'); listener.cacheGetRecentMetrics == nil &&
+	if star := strings.IndexByte(query, '*'); listener.getMetricStore() == nil && listener.cacheGetRecentMetrics == nil &&
 		strings.IndexByte(query, '[') == -1 &&
 		strings.IndexByte(query, '?') == -1 &&
 		(star == -1 || star == len(query)-1) {
@@ -1643,16 +1740,52 @@ func (listener *CarbonserverListener) Stat(send helper.StatCallback) {
 }
 
 func (listener *CarbonserverListener) Stop() error {
-	close(listener.forceScanChan)
+	if listener.forceScanChan != nil {
+		close(listener.forceScanChan)
+	}
 	if listener.scanTicker != nil {
 		listener.scanTicker.Stop()
 	}
-	close(listener.exitChan)
+	if listener.exitChan != nil {
+		close(listener.exitChan)
+	}
+	listener.fileListUpdaterWG.Wait()
+	if listener.httpServer != nil {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := listener.httpServer.Shutdown(shutdownContext)
+		cancel()
+		if err != nil {
+			listener.logger.Warn("failed to gracefully stop HTTP server", zap.Error(err))
+			listener.httpServer.Close()
+		}
+	}
+	if listener.grpcServer != nil {
+		gracefulStopped := make(chan struct{})
+		go func() {
+			listener.grpcServer.GracefulStop()
+			close(gracefulStopped)
+		}()
+		select {
+		case <-gracefulStopped:
+		case <-time.After(30 * time.Second):
+			listener.logger.Warn("timed out stopping gRPC server; forcing shutdown")
+			listener.grpcServer.Stop()
+			<-gracefulStopped
+		}
+	}
+	listener.serverWG.Wait()
+	if listener.getMetricStore() != nil {
+		listener.stopSharedStoreRequests(30 * time.Second)
+	}
 	if listener.db != nil {
 		listener.db.Close()
 	}
-	listener.tcpListener.Close()
-	listener.grpcListener.Close()
+	if listener.tcpListener != nil {
+		listener.tcpListener.Close()
+	}
+	if listener.grpcListener != nil {
+		listener.grpcListener.Close()
+	}
 	return nil
 }
 
@@ -1745,6 +1878,12 @@ func (listener *CarbonserverListener) shouldBlockForIndex() bool {
 
 func (listener *CarbonserverListener) rateLimitRequest(h http.HandlerFunc) http.HandlerFunc {
 	return func(wr http.ResponseWriter, req *http.Request) {
+		accepted, locked := listener.beginSharedStoreRequest()
+		if !accepted {
+			http.Error(wr, "Service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		defer listener.endSharedStoreRequest(locked)
 		ratelimiter := listener.getPathRateLimiter(req.URL.Path)
 		// Can't use http.TimeoutHandler here due to supporting per-path timeout
 		newTimeout := listener.getPathRateLimiterTimeout(ratelimiter)
@@ -1824,10 +1963,19 @@ func (listener *CarbonserverListener) Listen(listen string) error {
 	)
 
 	listener.exitChan = make(chan struct{})
-	if (listener.trigramIndex || listener.trieIndex) && listener.scanFrequency != 0 {
+	if listener.getMetricStore() != nil && (listener.trigramIndex || listener.trieIndex) {
+		listener.forceScanChan = make(chan struct{})
+		var scanFrequency <-chan time.Time
+		if listener.scanFrequency != 0 {
+			listener.scanTicker = time.NewTicker(listener.scanFrequency)
+			scanFrequency = listener.scanTicker.C
+		}
+		listener.startFileListUpdater(listener.whisperData, scanFrequency, listener.forceScanChan, listener.exitChan)
+		listener.forceScanChan <- struct{}{}
+	} else if (listener.trigramIndex || listener.trieIndex) && listener.scanFrequency != 0 {
 		listener.forceScanChan = make(chan struct{})
 		listener.scanTicker = time.NewTicker(listener.scanFrequency)
-		go listener.fileListUpdater(listener.whisperData, listener.scanTicker.C, listener.forceScanChan, listener.exitChan) //nolint:staticcheck
+		listener.startFileListUpdater(listener.whisperData, listener.scanTicker.C, listener.forceScanChan, listener.exitChan)
 		listener.forceScanChan <- struct{}{}
 	}
 
@@ -1987,7 +2135,14 @@ func (listener *CarbonserverListener) Listen(listen string) error {
 		WriteTimeout: listener.writeTimeout,
 	}
 
-	go srv.Serve(listener.tcpListener)
+	listener.httpServer = srv
+	listener.serverWG.Add(1)
+	go func() {
+		defer listener.serverWG.Done()
+		if err := srv.Serve(listener.tcpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			listener.logger.Error("HTTP server stopped", zap.Error(err))
+		}
+	}()
 
 	return nil
 }
@@ -2163,7 +2318,14 @@ func (listener *CarbonserverListener) ListenGRPC(listen string) error {
 		listener.UnaryServerRatelimitHandler()))
 	grpcServer := grpc.NewServer(opts...) //skipcq: GO-S0902
 	grpcv2.RegisterCarbonV2Server(grpcServer, listener)
-	go grpcServer.Serve(listener.grpcListener)
+	listener.grpcServer = grpcServer
+	listener.serverWG.Add(1)
+	go func() {
+		defer listener.serverWG.Done()
+		if err := grpcServer.Serve(listener.grpcListener); err != nil {
+			listener.logger.Error("gRPC server stopped", zap.Error(err))
+		}
+	}()
 	return nil
 }
 
@@ -2180,6 +2342,11 @@ func (listener *CarbonserverListener) getPathRateLimiterTimeout(ratelimiter *Api
 
 func (listener *CarbonserverListener) UnaryServerRatelimitHandler() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		accepted, locked := listener.beginSharedStoreRequest()
+		if !accepted {
+			return nil, status.Error(codes.Unavailable, "Service unavailable")
+		}
+		defer listener.endSharedStoreRequest(locked)
 		t0 := time.Now()
 		var payload string
 		if reqStringer, ok := req.(fmt.Stringer); ok {
@@ -2203,6 +2370,11 @@ func (listener *CarbonserverListener) UnaryServerRatelimitHandler() grpc.UnarySe
 
 func (listener *CarbonserverListener) StreamServerRatelimitHandler() grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		accepted, locked := listener.beginSharedStoreRequest()
+		if !accepted {
+			return status.Error(codes.Unavailable, "Service unavailable")
+		}
+		defer listener.endSharedStoreRequest(locked)
 		t0 := time.Now()
 		fullMethodName := info.FullMethod
 		wss := grpcutil.GetWrappedStream(ss)

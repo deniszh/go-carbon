@@ -26,6 +26,7 @@ record candidate output as a replacement expected result merely to make CI green
 | `TestStorageParity` | 864 engine/policy/trace combinations: six aggregation methods, XFF 0/0.5/1, ordered and shuffled batches, same-timestamp and same-slot duplicates, sparse rollups, late hole fills and corrections with/without rollups, retries, historical corrections, retention boundaries, full/partial block ring wrap, expiry/future admission and special float values |
 | `TestStorageFetchEdges` | Empty/populated files, zero/sub-step/exact-step queries, archive-selection boundaries and clipping (432 cases) |
 | `TestStorageRandomizedParity` | Three fixed seeds across six aggregation methods for OOO and Pebble; mixed-age batches, duplicates, clock advances, periodic compaction and reopen; failures include the seed, batch and clock |
+| `TestStorageLateRollupRetentionWrap` | 4,096 alternating late-write batches across three archives; checks the first fine-retention wrap on every update, later cycles periodically, and final compaction/reopen |
 | `TestStorageCircularSlotWriteOrder` | Fine/coarse circular-slot collisions between future points and historical corrections in both write orders; checks every resolution before/after time advances, compaction and reopen |
 | `TestStorageCWhisperLateLimitation` | Explicitly verifies plain cwhisper loses a late point, while classic, OOO and Pebble retain it; verifies an actual sidecar is created and removed by merge |
 | `TestStorageCrashRecovery` | A child exits after acknowledged writes without cleanup; checks four metrics after recovery, additional writes, compaction and another restart; Pebble covers WAL-only and SST plus newer WAL data |
@@ -94,6 +95,7 @@ single `ns/op` sample. Run the correctness gate before accepting an optimization
 | `BenchmarkStorageWrite` | One batch of 1/8/64 points into 1/128 metrics, ordered or filling holes from previous batches; file open/lock/update/close versus shared Pebble commit |
 | `BenchmarkStorageRead` | Open/fetch/close for files or shared-store fetch; recent/full fine resolution and historical coarse reads with a warm filesystem cache |
 | `BenchmarkStorageConcurrentWrite` | Rounds of eight-point writes from 1/8/32 workers to distinct metrics, including scheduling and Pebble's opportunity to group WAL syncs; all metrics checked against a bounded classic replay afterwards |
+| `BenchmarkStorageRollup` | Three-archive ordered/late writes and coarse reads with/without pending corrections; classic comparison before and after timed work, compaction and reopen |
 | `BenchmarkStorageMaintenance` | OOO merge or Pebble flush plus full-keyspace compaction, after reseeding a bounded 1,024-point workload outside the timer |
 | `BenchmarkStorageReopen` | Reopen plus first fetch for a one-metric store; Pebble closes/reopens the database, files open/close their metric |
 
@@ -142,7 +144,20 @@ store modules to that published revision and vendors their contents; no local
 `replace` is used. Both modules resolve through the public Go proxy and checksum
 database, including from a fresh module cache.
 
-## Validation after fixes (2026-10-03)
+## Performance implementation (2026-10-03)
+
+Both modules now pin `v0.0.0-20261003193447-16b07882e95e`. The additional OOO
+retention-wrap fix, classic/compressed/OOO/Pebble read optimizations, and OOO
+single-archive replay optimization are published upstream. The full consumer
+race suite and all 86 benchmark smoke cases pass with that public pin. See
+[results and scope](storage-performance-results.md) for the 1,440 matched
+measurements, Linux validation and 100,000-metric qualification.
+
+## Earlier correctness validation (2026-10-03)
+
+This records the initial correctness pin. See
+[performance implementation results](storage-performance-results.md) for the
+subsequent retention-wrap fix, optimizations, current pin and validation.
 
 Validated with Go 1.27.1 on macOS/arm64 and Linux/arm64. Root Whisper is pinned
 to `d84403499e32` (shared compressed fix `fbae74965bf0`, followed by the OOO fix).
@@ -169,7 +184,8 @@ transfer and archive-persistence tests also pass.
 - The upstream library's full ordinary suite and targeted race tests for
   compressed/OOO/rewrite paths pass. Its full race suite exceeded the 10-minute
   timeout in the existing CPU-heavy `TestFillCompressedMix`; no race was reported
-  before the timeout. That whole-library race run remains incomplete.
+  before the timeout. The later performance validation completed a full library
+  race run with a 30-minute timeout.
 - `go vet ./...`, `go mod verify`, and `git diff --check` pass.
 
 ## Historical baseline before fixes

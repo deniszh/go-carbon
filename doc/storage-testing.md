@@ -26,6 +26,7 @@ record candidate output as a replacement expected result merely to make CI green
 | `TestStorageParity` | 864 engine/policy/trace combinations: six aggregation methods, XFF 0/0.5/1, ordered and shuffled batches, same-timestamp and same-slot duplicates, sparse rollups, late hole fills and corrections with/without rollups, retries, historical corrections, retention boundaries, full/partial block ring wrap, expiry/future admission and special float values |
 | `TestStorageFetchEdges` | Empty/populated files, zero/sub-step/exact-step queries, archive-selection boundaries and clipping (432 cases) |
 | `TestStorageRandomizedParity` | Three fixed seeds across six aggregation methods for OOO and Pebble; mixed-age batches, duplicates, clock advances, periodic compaction and reopen; failures include the seed, batch and clock |
+| `TestStorageCircularSlotWriteOrder` | Fine/coarse circular-slot collisions between future points and historical corrections in both write orders; checks every resolution before/after time advances, compaction and reopen |
 | `TestStorageCWhisperLateLimitation` | Explicitly verifies plain cwhisper loses a late point, while classic, OOO and Pebble retain it; verifies an actual sidecar is created and removed by merge |
 | `TestStorageCrashRecovery` | A child exits after acknowledged writes without cleanup; checks four metrics after recovery, additional writes, compaction and another restart; Pebble covers WAL-only and SST plus newer WAL data |
 | `TestStorageConcurrentMetrics` | Eight writers with distinct values and interleaved reads; checks metric isolation and restart, including race detection |
@@ -120,7 +121,57 @@ and an intended compaction cadence to account for that cost. Fixed operation
 counts help compare the same number of submitted points. No timing threshold is
 enforced in CI.
 
-## Initial findings on this branch
+## Correctness fixes
+
+Classic Whisper remains the reference; its storage behavior is unchanged.
+
+- cwhisper grows capacity before block rotation can overwrite retained samples,
+  applies classic XFF and query-grid rules to live rollups, preserves circular-slot
+  overwrite semantics, and materializes buffered history before policy changes.
+- OOO exposes corrected aggregates immediately, including cascading rollups and
+  explicit NaN corrections. Compaction preserves corrected buffers. Exceptional
+  circular-slot collisions replay classic write order in an in-memory scratch
+  archive before publishing the compressed replacement; ordinary updates retain
+  the incremental path.
+- Pebble uses the corrected store revision for mixed-age retention routing and
+  propagation past partial XFF windows. WAL synchronization is unchanged.
+
+The root library fixes live on `fix/storage-correctness` in go-whisper, with
+separate compressed/OOO commits and library regressions. go-carbon pins those
+commits and vendors their contents; no permanent local `replace` is used.
+The library branch must be published before a clean module-only build can resolve
+the new root module revision. Vendored builds are self-contained.
+
+## Validation after fixes (2026-10-03)
+
+Validated with Go 1.27.1 on macOS/arm64 and Linux/arm64. Root Whisper is pinned
+to `d84403499e32` (shared compressed fix `fbae74965bf0`, followed by the OOO fix);
+the nested store is pinned to `5f2e38dab385`.
+
+| Engine | Parity passed | Fetch edges passed | Random traces passed | Slot-order cases passed |
+| --- | ---: | ---: | ---: | ---: |
+| cwhisper | 198 | 144 | Unsupported late writes | 2 |
+| cwhisper OOO | 288 | 144 | 18 | 6 |
+| Pebble | 288 | 144 | 18 | 6 |
+
+The 90 known plain-cwhisper late-write cases remain explicitly skipped. OOO and
+Pebble have no parity skips. Recovery, isolation, persister acknowledgements,
+transfer and archive-persistence tests also pass.
+
+- Full go-carbon suite: `go test -mod=vendor -race -count=1 ./...` passes.
+- Linux: all persister tests pass with `-race -count=1` in
+  `golang:1.27.1-bookworm`, including physical sparse-sidecar allocation.
+  On this macOS filesystem, an independent Go sparse-file control loses holes
+  after close, so only that physical-allocation assertion is capability-skipped.
+- All 72 benchmark cases pass a one-iteration smoke run. These timings were
+  collected alongside tests and are not performance evidence.
+- The upstream library's full ordinary suite and targeted race tests for
+  compressed/OOO/rewrite paths pass. Its full race suite exceeded the 10-minute
+  timeout in the existing CPU-heavy `TestFillCompressedMix`; no race was reported
+  before the timeout. That whole-library race run remains incomplete.
+- `go vet ./...`, `go mod verify`, and `git diff --check` pass.
+
+## Historical baseline before fixes
 
 The first run on macOS/arm64, Go 1.27.1, found existing strict-parity failures:
 
@@ -150,14 +201,13 @@ go test -mod=vendor ./persister -run '^TestStorageParity/cwhisper-ooo/average/xf
 Recovery, concurrent metric isolation, persister acknowledgements, imports and
 exports passed in the initial run. Read/maintenance/reopen benchmark smoke runs
 passed; write benchmark cases reject compressed-storage window discrepancies.
-These results do not qualify all backends as
-classic-compatible: the oracle suite currently fails and must remain visible.
-This change adds tests and benchmarks; it does not patch vendored engines.
+These were failures in the original test-only change. Keep the strict oracle
+checks as regression gates for the fixes described above.
 
 The suite is synthetic, with bounded cardinality. It does not simulate power
 loss, disk-full/failed-fsync/torn-WAL faults, crashes *during* a write or rename,
 multi-process replacement races, cold-cache reads, production RSS, latency
 percentiles or end-to-end receiver/cache throughput. A passing suite is a
 regression gate for these cases, not a proof against every form of corruption.
-Linux/filesystem validation and a representative production canary remain
+Production filesystem qualification and a representative production canary remain
 separate checks before deploying storage changes.

@@ -89,6 +89,47 @@ func TestStorageRandomizedParity(t *testing.T) {
 	}
 }
 
+func TestStorageCircularSlotWriteOrder(t *testing.T) {
+	now := storageTestClock(t)
+	for _, kind := range storageBackends[1:] {
+		for _, schema := range []string{"1s:1m", "1s:10s,10s:1m,60s:1h"} {
+			for _, order := range []string{"correction-first", "future-first", "future-only"} {
+				if kind == "cwhisper" && order != "future-only" {
+					continue // Plain cwhisper does not support historical corrections.
+				}
+				t.Run(fmt.Sprintf("%s/%s/%s", kind, schema, order), func(t *testing.T) {
+					now.Store(storageEpoch)
+					oracle := newStorageBackend(t, "classic", now)
+					candidate := newStorageBackend(t, kind, now)
+					c := storageConfig("metric", schema, whisper.Average, 0)
+					storageMust(t, oracle.create(c))
+					storageMust(t, candidate.create(c))
+					initial := []whisper.TimeSeriesPoint{{Time: storageEpoch - 50, Value: 7}, {Time: storageEpoch - 40, Value: 8}}
+					correction := []whisper.TimeSeriesPoint{{Time: storageEpoch - 50, Value: 11}}
+					future := []whisper.TimeSeriesPoint{{Time: storageEpoch + 10, Value: 9}}
+					batches := [][]whisper.TimeSeriesPoint{initial, future, correction}
+					switch order {
+					case "correction-first":
+						batches = [][]whisper.TimeSeriesPoint{initial, correction, future}
+					case "future-only":
+						batches = [][]whisper.TimeSeriesPoint{initial, future}
+					}
+					for i, batch := range batches {
+						storageMust(t, oracle.update(c.Name, batch))
+						storageMust(t, candidate.update(c.Name, batch))
+						storageCompare(t, oracle, candidate, c, fmt.Sprintf("batch=%d", i))
+					}
+					now.Add(20)
+					storageCompare(t, oracle, candidate, c, "future-now-visible")
+					storageMust(t, candidate.compact([]string{c.Name}))
+					storageMust(t, candidate.reopen())
+					storageCompare(t, oracle, candidate, c, "compacted-and-reopened")
+				})
+			}
+		}
+	}
+}
+
 func storageRecoveryBatches(kind string) [][]whisper.TimeSeriesPoint {
 	result := [][]whisper.TimeSeriesPoint{storagePoints(storageEpoch-200, 64, 1), storagePoints(storageEpoch-100, 64, 1)}
 	if kind != "cwhisper" {

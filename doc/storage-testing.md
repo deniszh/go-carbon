@@ -136,17 +136,18 @@ Classic Whisper remains the reference; its storage behavior is unchanged.
 - Pebble uses the corrected store revision for mixed-age retention routing and
   propagation past partial XFF windows. WAL synchronization is unchanged.
 
-The root library fixes live on `fix/storage-correctness` in go-whisper, with
-separate compressed/OOO commits and library regressions. go-carbon pins those
-commits and vendors their contents; no permanent local `replace` is used.
-The library branch must be published before a clean module-only build can resolve
-the new root module revision. Vendored builds are self-contained.
+The library fixes are published on go-whisper's `master`, with separate
+compressed/OOO commits and library regressions. go-carbon pins the root and
+store modules to that published revision and vendors their contents; no local
+`replace` is used. Both modules resolve through the public Go proxy and checksum
+database, including from a fresh module cache.
 
 ## Validation after fixes (2026-10-03)
 
 Validated with Go 1.27.1 on macOS/arm64 and Linux/arm64. Root Whisper is pinned
-to `d84403499e32` (shared compressed fix `fbae74965bf0`, followed by the OOO fix);
-the nested store is pinned to `5f2e38dab385`.
+to `d84403499e32` (shared compressed fix `fbae74965bf0`, followed by the OOO fix).
+The nested store is pinned to the same revision; its code is unchanged from the
+previously validated `5f2e38dab385` store revision.
 
 | Engine | Parity passed | Fetch edges passed | Random traces passed | Slot-order cases passed |
 | --- | ---: | ---: | ---: | ---: |

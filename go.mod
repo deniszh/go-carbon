@@ -12,7 +12,7 @@ require (
 	github.com/dgryski/go-trigram v0.0.0-20160407183937-79ec494e1ad0
 	github.com/dgryski/httputil v0.0.0-20160116060654-189c2918cd08
 	github.com/go-graphite/carbonzipper v0.0.0-20191211140943-b9a9d1881aed
-	github.com/go-graphite/go-whisper v0.0.0-20261003174933-d84403499e32
+	github.com/go-graphite/go-whisper v0.0.0-20261003193447-16b07882e95e
 	github.com/go-graphite/protocol v1.0.1-0.20220718132526-4b842ba389ee
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/snappy v0.0.4
@@ -69,7 +69,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/go-graphite/go-whisper/store v0.0.0-20261003174933-d84403499e32
+	github.com/go-graphite/go-whisper/store v0.0.0-20261003193447-16b07882e95e
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1

@@ -176,10 +176,10 @@ github.com/getsentry/sentry-go/internal/traceparser
 # github.com/go-graphite/carbonzipper v0.0.0-20191211140943-b9a9d1881aed
 ## explicit
 github.com/go-graphite/carbonzipper/zipper/httpHeaders
-# github.com/go-graphite/go-whisper v0.0.0-20261003174933-d84403499e32
+# github.com/go-graphite/go-whisper v0.0.0-20261003193447-16b07882e95e
 ## explicit; go 1.18
 github.com/go-graphite/go-whisper
-# github.com/go-graphite/go-whisper/store v0.0.0-20261003174933-d84403499e32
+# github.com/go-graphite/go-whisper/store v0.0.0-20261003193447-16b07882e95e
 ## explicit; go 1.18
 github.com/go-graphite/go-whisper/store
 # github.com/go-graphite/protocol v1.0.1-0.20220718132526-4b842ba389ee

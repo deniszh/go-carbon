@@ -64,7 +64,25 @@ func Debug(compress, bitsWrite bool) {
 }
 
 func (whisper *Whisper) WriteHeaderCompressed() (err error) {
-	b := make([]byte, whisper.MetadataSize())
+	scratch := compressedHeaderScratch.Get().(*[]byte)
+	b := *scratch
+	size := whisper.MetadataSize()
+	if cap(b) < size {
+		b = make([]byte, size)
+	}
+	b = b[:size]
+	// Reserved fields and the CRC placeholder must start at zero when
+	// reusing storage that previously held a different file's header.
+	for i := range b {
+		b[i] = 0
+	}
+	defer func() {
+		if cap(b) > 64*1024 {
+			b = nil
+		}
+		*scratch = b[:0]
+		compressedHeaderScratch.Put(scratch)
+	}()
 	i := 0
 
 	// magic string
@@ -387,33 +405,9 @@ func (archive *archiveInfo) getRange() (from, until int) {
 func (archive *archiveInfo) hasBuffer() bool { return archive.bufferSize > 0 }
 
 func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) ([]dataPoint, error) {
-	var dst []dataPoint // TODO: optimize this with pre-allocation
-	var buf = make([]byte, archive.blockSize)
-	for _, block := range archive.getSortedBlockRanges() {
-		if block.end >= int(start) && int(end) >= block.start {
-			if err := whisper.fileReadAt(buf, int64(archive.blockOffset(block.index))); err != nil {
-				return nil, fmt.Errorf("fetchCompressed.%d.%d: %s", archive.numberOfPoints, block.index, err)
-			}
-
-			var err error
-			dst, _, err = archive.ReadFromBlock(buf, dst, int(start), int(end))
-			if err != nil {
-				return dst, err
-			}
-
-			for i := 0; i < archive.blockSize; i++ {
-				buf[i] = 0
-			}
-		}
-	}
-
-	if archive.hasBuffer() {
-		dps := unpackDataPoints(archive.buffer)
-		for _, p := range dps {
-			if p.interval != 0 && int(start) <= p.interval && p.interval <= int(end) {
-				dst = append(dst, p)
-			}
-		}
+	dst, err := whisper.storedPoints(archive, int(start), int(end))
+	if err != nil {
+		return nil, err
 	}
 
 	base := whisper.archives[0]
@@ -467,7 +461,6 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 			if arc == archive {
 				break
 			}
-			values := make(map[int]float64)
 			buffered := unpackDataPointsStrict(arc.buffer)
 			from, until, present := spanOf(buffered, pending)
 			var stored []dataPoint
@@ -484,21 +477,23 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 					return nil, err
 				}
 			}
+			values := make(map[int]float64, len(stored)+len(pending))
 			for _, p := range stored {
 				values[p.interval] = p.value
 			}
 			for _, p := range pending {
 				values[p.interval] = p.value
 			}
-			var points []dataPoint
+			points := make([]dataPoint, 0, len(values))
 			for interval, value := range values {
 				points = append(points, dataPoint{interval, value})
 			}
 			sort.Slice(points, func(i, j int) bool { return points[i].interval < points[j].interval })
 			pending = nil
+			known := make([]float64, 0, arc.next.secondsPerPoint/arc.secondsPerPoint)
 			for i := 0; i < len(points); {
 				window := arc.AggregateInterval(points[i].interval)
-				var known []float64
+				known = known[:0]
 				for i < len(points) && arc.AggregateInterval(points[i].interval) == window {
 					known = append(known, points[i].value)
 					i++
@@ -516,7 +511,7 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 	if whisper.aggregationMethod == Mix {
 		return dst, nil
 	}
-	dst, err := whisper.filterCompressedSlots(archive, dst)
+	dst, err = whisper.filterCompressedSlots(archive, dst)
 	if err != nil {
 		return nil, err
 	}
@@ -535,11 +530,25 @@ func (whisper *Whisper) filterCompressedSlots(archive *archiveInfo, points []dat
 	if whisper.aggregationMethod == Mix {
 		return points, nil
 	}
-	from, _, ok := spanOf(points)
+	from, until, ok := spanOf(points)
 	if !ok {
 		return points, nil
 	}
 	newerFrom := from + archive.MaxRetention()
+	_, latestInterval := archive.getRange()
+	if until > latestInterval {
+		latestInterval = until
+	}
+	for offset := 0; offset < len(archive.buffer); offset += PointSize {
+		if interval := unpackInt(archive.buffer[offset:]); interval > latestInterval {
+			latestInterval = interval
+		}
+	}
+	// Include both stored and virtual buffered points in the bound. A span
+	// shorter than one ring cannot contain aliases of different timestamps.
+	if latestInterval < newerFrom {
+		return points, nil
+	}
 	newer, err := whisper.storedPoints(archive, newerFrom, maxInt)
 	if err != nil {
 		return nil, err
@@ -709,6 +718,7 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 			continue
 		}
 
+		previousEnd := archive.cblock.pn1.interval
 		if _, err := archive.appendToBlockAndRotate(dps); err != nil {
 			// TODO: record and continue?
 			return dropped, err
@@ -717,6 +727,18 @@ func (whisper *Whisper) archiveUpdateManyCompressed(archive *archiveInfo, points
 		// propagate
 		lower := archive.next
 		lowerIntervalStart := archive.AggregateInterval(dps[0].interval)
+		// A rewrite can encode the beginning of an unfinished window. When
+		// its remaining buffer is flushed, aggregate the whole stored window.
+		if previousEnd >= lowerIntervalStart {
+			dps, err = whisper.storedPoints(archive, lowerIntervalStart, lowerIntervalStart+lower.secondsPerPoint-archive.secondsPerPoint)
+			if err != nil {
+				return dropped, err
+			}
+			dps, err = whisper.filterCompressedSlots(archive, dps)
+			if err != nil {
+				return dropped, err
+			}
+		}
 
 		var knownValues []float64
 		for _, dPoint := range dps {

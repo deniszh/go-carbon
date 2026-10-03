@@ -103,8 +103,8 @@ github.com/go-errors/errors v1.4.2 h1:J6MZopCL4uSllY1OfXM374weqZFFItUbrImctkmUxI
 github.com/go-errors/errors v1.4.2/go.mod h1:sIVyrIiJhuEF+Pj9Ebtd6P/rEYROXFi3BopGUQ5a5Og=
 github.com/go-graphite/carbonzipper v0.0.0-20191211140943-b9a9d1881aed h1:f5BBBdpKP3ODvyLFjzc3b2dgm6SsXtnAKYvLvUGQozc=
 github.com/go-graphite/carbonzipper v0.0.0-20191211140943-b9a9d1881aed/go.mod h1:sfZ+AkP8/bBcWSGVqhseV6t6e/+C0i/PkTpA32W5rXs=
-github.com/go-graphite/go-whisper v0.0.0-20261002131613-5f2e38dab385 h1:+qy76c5eBxWpXCKPBdGjD146+HgcgnQd73OeZME5oFM=
-github.com/go-graphite/go-whisper v0.0.0-20261002131613-5f2e38dab385/go.mod h1:1edRhfqJoiHSjN72nYptHK0YR4yYt8aPC4NRHWhT0XE=
+github.com/go-graphite/go-whisper v0.0.0-20261003170658-fbae74965bf0 h1:r/cX17Kso65vZqay47+K4teQgMpomT1D23mApsUG+Rc=
+github.com/go-graphite/go-whisper v0.0.0-20261003170658-fbae74965bf0/go.mod h1:1edRhfqJoiHSjN72nYptHK0YR4yYt8aPC4NRHWhT0XE=
 github.com/go-graphite/go-whisper/store v0.0.0-20261002131613-5f2e38dab385 h1:D9K2D9zeKpcBUls+Gvpmis+Im3iWxYCmMdf7jwOVGMI=
 github.com/go-graphite/go-whisper/store v0.0.0-20261002131613-5f2e38dab385/go.mod h1:9h4Ac5lZj7lS/WAbEH8VpmcCm5E1iVFQViaOhKMZjIQ=
 github.com/go-graphite/protocol v1.0.1-0.20220718132526-4b842ba389ee h1:Sb63UbLUOXtKFIfNfZIkWrs73vWD0ZKzrBdTjvlVOBQ=
